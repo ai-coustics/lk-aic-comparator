@@ -1,6 +1,8 @@
 import argparse
 import os
 from pathlib import Path
+import subprocess
+import tempfile
 from types import ModuleType
 
 import aic_sdk as aic
@@ -18,6 +20,11 @@ MODEL_TO_DOWNLOAD_ID = {
     "quail_l": "quail-l-16khz",
     "quail_vf_l": "quail-vf-2.0-l-16khz",
     "sparrow_s": "sparrow-s-48khz",
+}
+
+MODEL_TO_NOISE_CANCELLER_FILTER = {
+    "quail_l": "aic-quail-l",
+    "quail_vf_l": "aic-quail-vfl",
 }
 
 
@@ -95,6 +102,11 @@ def _parse_args() -> argparse.Namespace:
         "--write-outputs",
         action="store_true",
         help="Write processed outputs next to input for debugging",
+    )
+    parser.add_argument(
+        "--noise-canceller-path",
+        required=True,
+        help="Path to noise-canceller project (will run `uv run noise-canceller.py` there)",
     )
     return parser.parse_args()
 
@@ -249,22 +261,28 @@ def _process_with_plugin_ffi(
 
 
 def _print_report(
-    sdk_out: np.ndarray,
-    plugin_out: np.ndarray,
+    left_name: str,
+    left_out: np.ndarray,
+    right_name: str,
+    right_out: np.ndarray,
     *,
     atol: int,
     rtol: float,
 ) -> None:
-    if sdk_out.shape != plugin_out.shape:
-        print(f"FAILED: shape mismatch sdk={sdk_out.shape} plugin={plugin_out.shape}")
+    print(f"comparison: {left_name} vs {right_name}")
+    if left_out.shape != right_out.shape:
+        print(
+            f"FAILED: shape mismatch "
+            f"{left_name}={left_out.shape} {right_name}={right_out.shape}"
+        )
         return
 
-    diff = sdk_out.astype(np.int32) - plugin_out.astype(np.int32)
+    diff = left_out.astype(np.int32) - right_out.astype(np.int32)
     abs_diff = np.abs(diff)
-    equal_mask = np.isclose(sdk_out, plugin_out, rtol=rtol, atol=atol)
+    equal_mask = np.isclose(left_out, right_out, rtol=rtol, atol=atol)
     mismatches = np.where(~equal_mask)[0]
 
-    print(f"total_samples: {sdk_out.size}")
+    print(f"total_samples: {left_out.size}")
     print(f"matching_samples: {int(equal_mask.sum())}")
     print(f"mismatching_samples: {int(mismatches.size)}")
     print(f"max_abs_diff: {int(abs_diff.max(initial=0))}")
@@ -277,10 +295,55 @@ def _print_report(
     first = int(mismatches[0])
     print(
         "FIRST_MISMATCH: "
-        f"index={first} sdk={int(sdk_out[first])} plugin={int(plugin_out[first])} "
+        f"index={first} {left_name}={int(left_out[first])} "
+        f"{right_name}={int(right_out[first])} "
         f"abs_diff={int(abs_diff[first])}"
     )
     print("MISMATCH: outputs differ")
+
+
+def _process_with_noise_canceller(
+    *,
+    input_path: Path,
+    noise_canceller_path: Path,
+    filter_name: str,
+) -> tuple[np.ndarray, int]:
+    script_path = noise_canceller_path / "noise-canceller.py"
+    if not script_path.is_file():
+        raise FileNotFoundError(f"noise-canceller.py not found at {script_path}")
+
+    with tempfile.TemporaryDirectory(prefix="lk-aic-comparator-") as temp_dir:
+        output_path = Path(temp_dir) / "noise-canceller-output.wav"
+        cmd = [
+            "uv",
+            "run",
+            "noise-canceller.py",
+            str(input_path),
+            "--filter",
+            filter_name,
+            "--output",
+            str(output_path),
+            "--silent",
+        ]
+        _print_step(f"Noise-canceller: running `{' '.join(cmd)}`")
+        result = subprocess.run(
+            cmd,
+            cwd=noise_canceller_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=os.environ.copy(),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "noise-canceller failed.\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+        _print_step("Noise-canceller: processing complete")
+        output, sample_rate = _load_mono_float_audio(output_path)
+        output_i16 = (np.clip(output, -1.0, 1.0) * 32767.0).astype(np.int16)
+        return output_i16, sample_rate
 
 
 def main() -> int:
@@ -291,6 +354,7 @@ def main() -> int:
 
     input_path = Path(args.input_audio).expanduser().resolve()
     model_download_dir = Path(args.model_download_dir).expanduser().resolve()
+    noise_canceller_path = Path(args.noise_canceller_path).expanduser().resolve()
 
     if not input_path.is_file():
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -333,14 +397,38 @@ def main() -> int:
         livekit_token=livekit_token,
     )
 
+    if args.model not in MODEL_TO_NOISE_CANCELLER_FILTER:
+        raise ValueError(
+            f"Model '{args.model}' is not supported by noise-canceller comparison"
+        )
+    noise_filter = MODEL_TO_NOISE_CANCELLER_FILTER[args.model]
+    _print_step(
+        f"Running noise-canceller processor (path={noise_canceller_path}, filter={noise_filter})"
+    )
+    nc_out, nc_rate = _process_with_noise_canceller(
+        input_path=input_path,
+        noise_canceller_path=noise_canceller_path,
+        filter_name=noise_filter,
+    )
+    if nc_rate != sample_rate:
+        _print_step(
+            f"Noise-canceller output sample_rate={nc_rate} differs from input sample_rate={sample_rate}"
+        )
+
     _print_step("Comparing outputs")
-    _print_report(sdk_out, plugin_out, atol=args.atol, rtol=args.rtol)
+    _print_report("sdk", sdk_out, "plugin", plugin_out, atol=args.atol, rtol=args.rtol)
+    _print_report("sdk", sdk_out, "noise-canceller", nc_out, atol=args.atol, rtol=args.rtol)
+    _print_report(
+        "plugin", plugin_out, "noise-canceller", nc_out, atol=args.atol, rtol=args.rtol
+    )
 
     if args.write_outputs:
         out_dir = input_path.parent
         sf.write(out_dir / f"{input_path.stem}.sdk.wav", sdk_out, sample_rate)
         sf.write(out_dir / f"{input_path.stem}.plugin.wav", plugin_out, sample_rate)
+        sf.write(out_dir / f"{input_path.stem}.noise-canceller.wav", nc_out, nc_rate)
         print(f"wrote: {out_dir / (input_path.stem + '.sdk.wav')}")
         print(f"wrote: {out_dir / (input_path.stem + '.plugin.wav')}")
+        print(f"wrote: {out_dir / (input_path.stem + '.noise-canceller.wav')}")
 
     return 0
