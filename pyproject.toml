@@ -1,0 +1,18 @@
+[project]
+name = "lk-aic-comparator"
+version = "0.1.0"
+description = "Compare outputs between direct aic-sdk processing and LiveKit ai-coustics plugin processing."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aic-sdk",
+    "numpy",
+    "soundfile",
+]
+
+[project.scripts]
+lk-aic-compare = "lk_aic_comparator.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
