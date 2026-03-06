@@ -43,6 +43,9 @@ export LIVEKIT_API_SECRET=...
 
 ## 3) Run comparator
 
+This project expects a **local clone** of the [`noise-canceller`](https://github.com/livekit-examples/noise-canceller) repo.
+`--noise-canceller-path` must point to that local clone directory (the one containing `noise-canceller.py` and `pyproject.toml`).
+
 ```bash
 uv run lk-aic-compare --help
 ```
@@ -52,7 +55,7 @@ Example:
 ```bash
 uv run lk-aic-compare \
   --model quail_l \
-  --noise-canceller-path ~/dev/projects/noise-canceller \
+  --noise-canceller-path ~/path/to/noise-canceller \
   --write-outputs \
   gym_raw.wav
 ```
