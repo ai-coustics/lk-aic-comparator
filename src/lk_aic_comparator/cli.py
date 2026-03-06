@@ -13,13 +13,11 @@ import soundfile as sf
 MODEL_TO_FFI_ENUM = {
     "quail_l": "QUAIL_L",
     "quail_vf_l": "QUAIL_VF_L",
-    "sparrow_s": "SPARROW_S",
 }
 
 MODEL_TO_DOWNLOAD_ID = {
     "quail_l": "quail-l-16khz",
     "quail_vf_l": "quail-vf-2.0-l-16khz",
-    "sparrow_s": "sparrow-s-48khz",
 }
 
 MODEL_TO_NOISE_CANCELLER_FILTER = {
