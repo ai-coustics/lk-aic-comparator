@@ -21,6 +21,10 @@ MODEL_TO_DOWNLOAD_ID = {
 }
 
 
+def _print_step(message: str) -> None:
+    print(f"[lk-aic-comparator] {message}")
+
+
 def _load_env_file(path: Path) -> None:
     if not path.is_file():
         return
@@ -157,8 +161,10 @@ def _process_with_aic_sdk(
     model_download_dir: Path,
     license_key: str,
 ) -> np.ndarray:
+    _print_step(f"SDK: downloading model '{model_name}'...")
     model_id = MODEL_TO_DOWNLOAD_ID[model_name]
     model_path = aic.Model.download(model_id, str(model_download_dir))
+    _print_step(f"SDK: model ready at {model_path}")
     model = aic.Model.from_file(model_path)
     config = aic.ProcessorConfig(
         sample_rate=sample_rate,
@@ -169,11 +175,21 @@ def _process_with_aic_sdk(
     processor = aic.Processor(model, license_key, config)
 
     chunks: list[np.ndarray] = []
-    for chunk, valid_len in _chunk_audio(audio, frame_samples):
+    total_chunks = (audio.shape[0] + frame_samples - 1) // frame_samples
+    last_progress_bucket = -1
+    for idx, (chunk, valid_len) in enumerate(_chunk_audio(audio, frame_samples)):
         planar = chunk.reshape(1, -1).astype(np.float32, copy=False)
         out = processor.process(planar)[0]
         out_i16 = (np.clip(out, -1.0, 1.0) * 32767.0).astype(np.int16)
         chunks.append(out_i16[:valid_len])
+        progress_bucket = ((idx + 1) * 10) // max(total_chunks, 1)
+        if progress_bucket > last_progress_bucket:
+            last_progress_bucket = progress_bucket
+            _print_step(
+                f"SDK: processed {idx + 1}/{total_chunks} chunks "
+                f"({(idx + 1) * 100 // max(total_chunks, 1)}%)"
+            )
+    _print_step("SDK: processing complete")
     return np.concatenate(chunks, axis=0)
 
 
@@ -187,6 +203,7 @@ def _process_with_plugin_ffi(
     livekit_url: str,
     livekit_token: str,
 ) -> np.ndarray:
+    _print_step("Plugin: initializing enhancer...")
     model_enum = getattr(ffi.EnhancerModel, MODEL_TO_FFI_ENUM[model_name])
     settings = ffi.EnhancerSettings(
         sample_rate=sample_rate,
@@ -212,12 +229,22 @@ def _process_with_plugin_ffi(
     )
 
     chunks: list[np.ndarray] = []
-    for chunk, valid_len in _chunk_audio(audio, frame_samples):
+    total_chunks = (audio.shape[0] + frame_samples - 1) // frame_samples
+    last_progress_bucket = -1
+    for idx, (chunk, valid_len) in enumerate(_chunk_audio(audio, frame_samples)):
         buf = chunk.astype(np.float32, copy=True)
         native = ffi.NativeAudioBufferMut(ptr=buf.ctypes.data, len=buf.shape[0])
         enhancer.process(native)
         out_i16 = (np.clip(buf, -1.0, 1.0) * 32767.0).astype(np.int16)
         chunks.append(out_i16[:valid_len])
+        progress_bucket = ((idx + 1) * 10) // max(total_chunks, 1)
+        if progress_bucket > last_progress_bucket:
+            last_progress_bucket = progress_bucket
+            _print_step(
+                f"Plugin: processed {idx + 1}/{total_chunks} chunks "
+                f"({(idx + 1) * 100 // max(total_chunks, 1)}%)"
+            )
+    _print_step("Plugin: processing complete")
     return np.concatenate(chunks, axis=0)
 
 
@@ -258,7 +285,9 @@ def _print_report(
 
 def main() -> int:
     args = _parse_args()
-    _load_env_file(Path(args.env_file).expanduser().resolve())
+    env_path = Path(args.env_file).expanduser().resolve()
+    _print_step(f"Loading env from {env_path}")
+    _load_env_file(env_path)
 
     input_path = Path(args.input_audio).expanduser().resolve()
     model_download_dir = Path(args.model_download_dir).expanduser().resolve()
@@ -274,10 +303,17 @@ def main() -> int:
     frame_samples = sample_rate * args.frame_ms // 1000
     if frame_samples <= 0:
         raise ValueError("Computed frame size is invalid")
+    _print_step(
+        f"Input loaded: sample_rate={sample_rate}, samples={audio.shape[0]}, "
+        f"frame_samples={frame_samples}"
+    )
 
+    _print_step("Loading public LiveKit ai-coustics plugin")
     ffi = _load_ffi_module()
+    _print_step("Building LiveKit access token from API key/secret")
     livekit_url, livekit_token = _get_livekit_credentials(args.livekit_room)
 
+    _print_step("Running SDK processor")
     sdk_out = _process_with_aic_sdk(
         audio=audio,
         sample_rate=sample_rate,
@@ -286,6 +322,7 @@ def main() -> int:
         model_download_dir=model_download_dir,
         license_key=license_key,
     )
+    _print_step("Running plugin processor")
     plugin_out = _process_with_plugin_ffi(
         ffi=ffi,
         audio=audio,
@@ -296,6 +333,7 @@ def main() -> int:
         livekit_token=livekit_token,
     )
 
+    _print_step("Comparing outputs")
     _print_report(sdk_out, plugin_out, atol=args.atol, rtol=args.rtol)
 
     if args.write_outputs:
