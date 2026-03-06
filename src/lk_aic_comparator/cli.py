@@ -1,5 +1,4 @@
 import argparse
-import importlib.util
 import os
 from pathlib import Path
 from types import ModuleType
@@ -22,11 +21,30 @@ MODEL_TO_DOWNLOAD_ID = {
 }
 
 
+def _load_env_file(path: Path) -> None:
+    if not path.is_file():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if (
+            len(value) >= 2
+            and ((value[0] == value[-1] == '"') or (value[0] == value[-1] == "'"))
+        ):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare output from direct aic-sdk processor vs local "
-            "livekit-plugins-ai-coustics FFI enhancer."
+            "Compare output from direct aic-sdk processor vs public "
+            "livekit-plugins-ai-coustics enhancer."
         )
     )
     parser.add_argument("input_audio", help="Input wav/flac/etc (mono expected)")
@@ -42,12 +60,14 @@ def _parse_args() -> argparse.Namespace:
         help="Directory to cache downloaded aic-sdk models",
     )
     parser.add_argument(
-        "--plugin-package-dir",
-        default=(
-            "~/dev/projects/plugins-ai-coustics-internal/target/packages/python/"
-            "src/livekit/plugins/ai_coustics"
-        ),
-        help="Path that contains _ffi.py and libplugins_ai_coustics_uniffi.so",
+        "--livekit-room",
+        default="lk-aic-comparator",
+        help="Room name used when generating a LiveKit access token for plugin auth",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="Path to env file to load before reading credentials (default: .env)",
     )
     parser.add_argument(
         "--frame-ms",
@@ -75,17 +95,33 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_ffi_module(plugin_package_dir: Path) -> ModuleType:
-    ffi_path = plugin_package_dir / "_ffi.py"
-    if not ffi_path.is_file():
-        raise FileNotFoundError(f"FFI module not found: {ffi_path}")
+def _load_ffi_module() -> ModuleType:
+    from livekit.plugins.ai_coustics import _ffi
 
-    spec = importlib.util.spec_from_file_location("lk_aic_ffi", ffi_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to create import spec for: {ffi_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return _ffi
+
+
+def _get_livekit_credentials(room_name: str) -> tuple[str, str]:
+    livekit_url = os.getenv("LIVEKIT_URL")
+    if not livekit_url:
+        raise RuntimeError(
+            "LIVEKIT_URL is required when using public livekit-plugins-ai-coustics"
+        )
+
+    api_key = os.getenv("LIVEKIT_API_KEY")
+    api_secret = os.getenv("LIVEKIT_API_SECRET")
+    if not api_key or not api_secret:
+        raise RuntimeError("Set LIVEKIT_API_KEY and LIVEKIT_API_SECRET")
+
+    from livekit import api
+
+    token = (
+        api.AccessToken(api_key, api_secret)
+        .with_identity("lk-aic-comparator")
+        .with_grants(api.VideoGrants(room_join=True, room=room_name))
+        .to_jwt()
+    )
+    return livekit_url, token
 
 
 def _load_mono_float_audio(path: Path) -> tuple[np.ndarray, int]:
@@ -148,15 +184,16 @@ def _process_with_plugin_ffi(
     sample_rate: int,
     frame_samples: int,
     model_name: str,
+    livekit_url: str,
+    livekit_token: str,
 ) -> np.ndarray:
     model_enum = getattr(ffi.EnhancerModel, MODEL_TO_FFI_ENUM[model_name])
     settings = ffi.EnhancerSettings(
         sample_rate=sample_rate,
         num_channels=1,
         samples_per_channel=frame_samples,
-        credentials=ffi.Credentials(url="https://local.test", token="local-test-token"),
+        credentials=ffi.Credentials(url=livekit_url, token=livekit_token),
         model=model_enum,
-        model_parameters={},
         vad=ffi.VadSettings(
             speech_hold_duration=None,
             sensitivity=None,
@@ -221,9 +258,10 @@ def _print_report(
 
 def main() -> int:
     args = _parse_args()
+    _load_env_file(Path(args.env_file).expanduser().resolve())
+
     input_path = Path(args.input_audio).expanduser().resolve()
     model_download_dir = Path(args.model_download_dir).expanduser().resolve()
-    plugin_package_dir = Path(args.plugin_package_dir).expanduser().resolve()
 
     if not input_path.is_file():
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -237,7 +275,8 @@ def main() -> int:
     if frame_samples <= 0:
         raise ValueError("Computed frame size is invalid")
 
-    ffi = _load_ffi_module(plugin_package_dir)
+    ffi = _load_ffi_module()
+    livekit_url, livekit_token = _get_livekit_credentials(args.livekit_room)
 
     sdk_out = _process_with_aic_sdk(
         audio=audio,
@@ -253,6 +292,8 @@ def main() -> int:
         sample_rate=sample_rate,
         frame_samples=frame_samples,
         model_name=args.model,
+        livekit_url=livekit_url,
+        livekit_token=livekit_token,
     )
 
     _print_report(sdk_out, plugin_out, atol=args.atol, rtol=args.rtol)
