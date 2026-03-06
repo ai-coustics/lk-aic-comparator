@@ -50,10 +50,11 @@ uv run lk-aic-compare --help
 Example:
 
 ```bash
-uv run lk-aic-compare ~/dev/projects/noise-canceller-fork/noisy-sample.wav \
+uv run lk-aic-compare \
   --model quail_l \
   --noise-canceller-path ~/dev/projects/noise-canceller \
-  --write-outputs
+  --write-outputs \
+  gym_raw.wav
 ```
 
 If `mismatching_samples` is `0` (or within your tolerance), both processors match.
